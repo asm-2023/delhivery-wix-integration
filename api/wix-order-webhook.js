@@ -112,7 +112,14 @@ export default async function handler(req, res) {
   if (expectedSecret) {
     const provided = req.query?.secret;
     if (provided !== expectedSecret) {
-      return res.status(401).json({ error: "Unauthorized" });
+      return res.status(200).json({
+        debug: true,
+        error: "Unauthorized",
+        reason: "secret_mismatch",
+        providedSecret: provided ?? null,
+        expectedSecretIsSet: true,
+        queryKeys: Object.keys(req.query || {}),
+      });
     }
   }
 
@@ -121,7 +128,13 @@ export default async function handler(req, res) {
     const order = extractOrderFromPayload(body);
 
     if (!order) {
-      return res.status(400).json({ error: "Could not find order in payload" });
+      return res.status(200).json({
+        debug: true,
+        error: "Could not find order in payload",
+        bodyType: typeof body,
+        bodyKeys: body && typeof body === "object" ? Object.keys(body) : null,
+        bodyPreview: JSON.stringify(body)?.slice(0, 1000),
+      });
     }
 
     // Only push physical/shippable orders
@@ -165,7 +178,8 @@ export default async function handler(req, res) {
 
     if (!delhiveryResp.ok) {
       console.error("Delhivery API error", delhiveryResp.status, delhiveryJson);
-      return res.status(502).json({
+      return res.status(200).json({
+        debug: true,
         error: "Delhivery API error",
         status: delhiveryResp.status,
         details: delhiveryJson,
@@ -181,6 +195,6 @@ export default async function handler(req, res) {
     });
   } catch (err) {
     console.error("Webhook handler error", err);
-    return res.status(500).json({ error: String(err) });
+    return res.status(200).json({ debug: true, error: String(err), stack: err?.stack });
   }
 }
