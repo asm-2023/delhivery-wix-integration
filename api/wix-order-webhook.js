@@ -124,7 +124,22 @@ export default async function handler(req, res) {
   }
 
   try {
-    const body = req.body;
+    let body = req.body;
+    if (typeof body === "string") {
+      try {
+        body = JSON.parse(body);
+      } catch {
+        // leave as string; will be reported in debug below
+      }
+    }
+    if (Buffer.isBuffer(body)) {
+      try {
+        body = JSON.parse(body.toString("utf8"));
+      } catch {
+        body = body.toString("utf8");
+      }
+    }
+
     const order = extractOrderFromPayload(body);
 
     if (!order) {
@@ -133,7 +148,8 @@ export default async function handler(req, res) {
         error: "Could not find order in payload",
         bodyType: typeof body,
         bodyKeys: body && typeof body === "object" ? Object.keys(body) : null,
-        bodyPreview: JSON.stringify(body)?.slice(0, 1000),
+        bodyPreview: typeof body === "string" ? body.slice(0, 2000) : JSON.stringify(body)?.slice(0, 2000),
+        contentType: req.headers["content-type"] || null,
       });
     }
 
