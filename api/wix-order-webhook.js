@@ -6,16 +6,36 @@
 // Order Creation / Manifestation API to create the shipment.
 //
 // ENV VARS REQUIRED (set in Vercel project settings):
-//   DELHIVERY_API_TOKEN     - Delhivery API token (Bearer auth)
-//   DELHIVERY_PICKUP_NAME   - Registered pickup location name (e.g. "Mumbai Residence")
-//   DELHIVERY_SELLER_NAME   - Seller name as registered with Delhivery
-//   DELHIVERY_SELLER_GST    - Seller GST TIN (mandatory in Delhivery API)
-//   DELHIVERY_HSN_CODE      - HSN code for products (e.g. "4901" for books)
-//   DELHIVERY_BASE_URL      - https://track.delhivery.com (production)
-//   WIX_WEBHOOK_SECRET      - shared secret to validate inbound calls,
-//                             configured as a query param in the Wix Automation webhook URL
+//   DELHIVERY_API_TOKEN          - Delhivery API token (Bearer auth)
+//   DELHIVERY_PICKUP_NAME_MUMBAI - Mumbai pickup location name (default: "Mumbai Residence")
+//   DELHIVERY_PICKUP_NAME_PUNE   - Pune pickup location name (default: "Pune Residence")
+//   DELHIVERY_SELLER_NAME        - Seller name as registered with Delhivery
+//   DELHIVERY_SELLER_GST         - Seller GST TIN (mandatory in Delhivery API)
+//   DELHIVERY_HSN_CODE           - HSN code for products (e.g. "4901" for books)
+//   DELHIVERY_BASE_URL           - https://track.delhivery.com (production)
+//   WIX_WEBHOOK_SECRET           - shared secret to validate inbound calls,
+//                                  configured as a query param in the Wix Automation webhook URL
 
-const DEFAULT_WEIGHT_GRAMS = 180; // fallback - Wix "Order Placed" payload has no weight field
+const DEFAULT_WEIGHT_GRAMS = 180; // fallback for unmapped SKUs
+
+// Per-SKU weight in grams
+const SKU_WEIGHTS = {
+  "DA-S8DP-6A1T": 450, // 12 Shiva Jyotirlings [Hard Cover]
+  "amargranth-003": 450, // 51 Shaktipeeths [Hardcover]
+  "amargranth-004": 900, // 12 Jyotirlings + 51 Shaktipeeths Combo Set [Hardcover]
+  "amargranth-005": 200, // 12 Shiva Jyotirlings [Hindi] [Paperback]
+  "amargranth-007": 300, // Rivers of Bharat [Paperback]
+  "amargranth-008": 450, // Chronicles of Lord Parashurama [Hardcover]
+  "amargranth-010": 200, // Shiva's Tears: Rudraksha
+};
+
+// SKUs that require shipping from "Mumbai Residence" pickup location.
+// Any order containing one of these uses Mumbai Residence; otherwise Pune Residence.
+const MUMBAI_PICKUP_SKUS = new Set(["amargranth-003", "amargranth-004"]);
+
+// Default dimensions: 28x26cm for all books except the Rivers of Bharat
+// book (44x28cm). Height is 1cm for single-SKU orders, 3cm for multi-SKU orders.
+const RIVERS_SKU = "amargranth-007";
 
 function poundsToGrams(lb) {
   return Math.round(lb * 453.592);
@@ -108,6 +128,7 @@ function buildDelhiveryPayload(order) {
 
   const productsDesc = lineItems.map((li) => li.name).join(", ");
 
+  // Weight: sum of per-SKU weights (falls back to DEFAULT_WEIGHT_GRAMS for unmapped SKUs)
   let totalWeightGrams = 0;
   for (const li of lineItems) {
     const qty = li.qty || 1;
@@ -115,9 +136,25 @@ function buildDelhiveryPayload(order) {
     if (typeof weightLb === "number" && weightLb > 0) {
       totalWeightGrams += poundsToGrams(weightLb) * qty;
     } else {
-      totalWeightGrams += DEFAULT_WEIGHT_GRAMS * qty;
+      const perItemWeight = SKU_WEIGHTS[li.sku] ?? DEFAULT_WEIGHT_GRAMS;
+      totalWeightGrams += perItemWeight * qty;
     }
   }
+
+  // Dimensions: 44x28cm if order contains the Rivers of Bharat book, else 28x26cm.
+  // Height: 3cm for multi-SKU orders, 1cm for single-SKU orders.
+  const hasRiversBook = lineItems.some((li) => li.sku === RIVERS_SKU);
+  const isMultiSku = lineItems.length > 1;
+  const length = hasRiversBook ? 44 : 28;
+  const breadth = hasRiversBook ? 28 : 26;
+  const height = isMultiSku ? 3 : 1;
+
+  // Pickup location: Mumbai Residence if order contains the Shaktipeeths hardcover
+  // (amargranth-003) or the combo set (amargranth-004), else Pune Residence.
+  const needsMumbaiPickup = lineItems.some((li) => MUMBAI_PICKUP_SKUS.has(li.sku));
+  const pickupLocationName = needsMumbaiPickup
+    ? (process.env.DELHIVERY_PICKUP_NAME_MUMBAI || "Mumbai Residence")
+    : (process.env.DELHIVERY_PICKUP_NAME_PUNE || "Pune Residence");
 
   const totalAmount = parseFloat(order.total || "0");
   const paymentStatus = order.paymentStatus; // PAID, UNPAID, PARTIALLY_PAID, etc.
@@ -144,14 +181,15 @@ function buildDelhiveryPayload(order) {
     seller_gst_tin: process.env.DELHIVERY_SELLER_GST || "",
     seller_name: process.env.DELHIVERY_SELLER_NAME || "",
     hsn_code: hsnCode,
-    shipment_width: "",
-    shipment_height: "",
+    shipment_length: String(length),
+    shipment_width: String(breadth),
+    shipment_height: String(height),
     shipping_mode: "Surface",
   };
 
   return {
     pickup_location: {
-      name: process.env.DELHIVERY_PICKUP_NAME || "",
+      name: pickupLocationName,
     },
     shipments: [shipment],
   };
