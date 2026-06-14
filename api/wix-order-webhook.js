@@ -1,7 +1,8 @@
 // api/wix-order-webhook.js
 //
-// Receives a Wix "Order Approved" webhook (wix.ecom.v1.order.approved),
-// maps the order to a Delhivery shipment payload, and calls Delhivery's
+// Receives a Wix Automation "Order Placed" webhook payload (shape:
+// { data: { orderNumber, lineItems, shippingInfo, contact, priceSummary, ... } }),
+// maps it to a Delhivery shipment payload, and calls Delhivery's
 // Order Creation / Manifestation API to create the shipment.
 //
 // ENV VARS REQUIRED (set in Vercel project settings):
@@ -11,49 +12,106 @@
 //   DELHIVERY_SELLER_GST    - Seller GST TIN (mandatory in Delhivery API)
 //   DELHIVERY_HSN_CODE      - HSN code for products (e.g. "4901" for books)
 //   DELHIVERY_BASE_URL      - https://track.delhivery.com (production)
-//   WIX_WEBHOOK_SECRET      - (optional) shared secret to validate inbound calls,
+//   WIX_WEBHOOK_SECRET      - shared secret to validate inbound calls,
 //                             configured as a query param in the Wix Automation webhook URL
-//
-// NOTE ON AUTH:
-// Wix Automations "Send a webhook" action does not sign requests by default.
-// We recommend adding a query param `?secret=...` to the webhook URL configured
-// in the Wix Automation, and checking it here.
 
-const DEFAULT_WEIGHT_GRAMS = 180; // fallback if Wix doesn't provide item weight
+const DEFAULT_WEIGHT_GRAMS = 180; // fallback - Wix "Order Placed" payload has no weight field
 
 function poundsToGrams(lb) {
   return Math.round(lb * 453.592);
 }
 
-function extractOrderFromPayload(body) {
-  // Order Approved webhook shape:
-  // { entityFqdn: "wix.ecom.v1.order", slug: "approved", actionEvent: { body: { order: {...} } } }
-  if (body?.actionEvent?.body?.order) return body.actionEvent.body.order;
-  // Order Created webhook shape:
-  // { createdEvent: { entity: {...} } }
-  if (body?.createdEvent?.entity) return body.createdEvent.entity;
-  // Allow direct order object for manual testing
-  if (body?.number && body?.recipientInfo) return body;
+// Normalize whatever payload shape Wix sends into a common internal shape.
+function normalizeOrder(body) {
+  // Shape A (observed in practice): Wix Automation "Order Placed" trigger payload
+  // { data: { orderNumber, lineItems: [...], shippingInfo: { logistics: { shippingDestination: {...} } }, ... } }
+  const d = body?.data;
+  if (d?.orderNumber && Array.isArray(d?.lineItems)) {
+    const dest = d.shippingInfo?.logistics?.shippingDestination;
+    const address = dest?.address || d.billingInfo?.address || d.contact?.address || {};
+    const contactDetails = dest?.contactDetails || d.billingInfo?.contactDetails || {};
+
+    return {
+      number: d.orderNumber,
+      address: {
+        addressLine: address.addressLine || address.addressLine1 || "",
+        city: (address.city || "").trim(),
+        subdivisionFullname: address.subdivisionFullname || "",
+        subdivision: address.subdivision || "",
+        postalCode: address.postalCode || "",
+        countryFullname: address.countryFullname || "India",
+      },
+      contact: {
+        firstName: (contactDetails.firstName || d.contact?.name?.first || "").trim(),
+        lastName: (contactDetails.lastName || d.contact?.name?.last || "").trim(),
+        phone: contactDetails.phone || d.contact?.phone || "",
+      },
+      email: d.buyerEmail || d.contact?.email || "",
+      lineItems: d.lineItems.map((li) => ({
+        name: li.itemName || "Item",
+        sku: li.sku || "",
+        qty: li.quantity || 1,
+        weight: undefined, // not provided in this payload shape
+        shippable: li.shippable !== false, // default true if unspecified
+      })),
+      total: d.priceSummary?.total?.value ?? d.priceSummary?.total?.amount ?? "0",
+      paymentStatus: d.paymentStatus,
+    };
+  }
+
+  // Shape B: raw eCommerce Order entity (wix.ecom.v1.order.approved webhook, or direct order object)
+  const order =
+    body?.actionEvent?.body?.order ||
+    body?.createdEvent?.entity ||
+    (body?.number && body?.recipientInfo ? body : null);
+
+  if (order) {
+    const recipient = order.recipientInfo || {};
+    const address = recipient.address || {};
+    const contact = recipient.contactDetails || {};
+
+    return {
+      number: order.number,
+      address: {
+        addressLine: address.addressLine || address.addressLine1 || "",
+        city: (address.city || "").trim(),
+        subdivisionFullname: address.subdivisionFullname || "",
+        subdivision: address.subdivision || "",
+        postalCode: address.postalCode || "",
+        countryFullname: address.countryFullname || "India",
+      },
+      contact: {
+        firstName: (contact.firstName || "").trim(),
+        lastName: (contact.lastName || "").trim(),
+        phone: contact.phone || "",
+      },
+      email: order.buyerInfo?.email || "",
+      lineItems: (order.lineItems || []).map((li) => ({
+        name: li.productName?.original || "Item",
+        sku: li.physicalProperties?.sku || "",
+        qty: li.quantity || 1,
+        weight: li.physicalProperties?.weight,
+        shippable: li.physicalProperties?.shippable !== false,
+      })),
+      total: order.priceSummary?.total?.amount ?? "0",
+      paymentStatus: order.paymentStatus,
+    };
+  }
+
   return null;
 }
 
 function buildDelhiveryPayload(order) {
-  const recipient = order.recipientInfo || {};
-  const address = recipient.address || {};
-  const contact = recipient.contactDetails || {};
-
+  const address = order.address || {};
+  const contact = order.contact || {};
   const lineItems = order.lineItems || [];
 
-  // Combine product names for products_desc
-  const productsDesc = lineItems
-    .map((li) => li.productName?.original || "Item")
-    .join(", ");
+  const productsDesc = lineItems.map((li) => li.name).join(", ");
 
-  // Total weight: sum of (weight_in_lb * qty), converted to grams
   let totalWeightGrams = 0;
   for (const li of lineItems) {
-    const qty = li.quantity || 1;
-    const weightLb = li.physicalProperties?.weight;
+    const qty = li.qty || 1;
+    const weightLb = li.weight;
     if (typeof weightLb === "number" && weightLb > 0) {
       totalWeightGrams += poundsToGrams(weightLb) * qty;
     } else {
@@ -61,19 +119,18 @@ function buildDelhiveryPayload(order) {
     }
   }
 
-  const totalAmount = parseFloat(order.priceSummary?.total?.amount || "0");
+  const totalAmount = parseFloat(order.total || "0");
   const paymentStatus = order.paymentStatus; // PAID, UNPAID, PARTIALLY_PAID, etc.
   const paymentMode = paymentStatus === "PAID" ? "Prepaid" : "COD";
   const codAmount = paymentMode === "COD" ? totalAmount : 0;
 
-  // HSN codes: one per line item, repeated for quantity if needed
   const hsnCode = process.env.DELHIVERY_HSN_CODE || "4901";
 
   const shipment = {
     name: `${contact.firstName || ""} ${contact.lastName || ""}`.trim(),
-    add: address.addressLine || address.addressLine1 || "",
+    add: address.addressLine || "",
     pin: address.postalCode || "",
-    city: (address.city || "").trim(),
+    city: address.city || "",
     state: address.subdivisionFullname || address.subdivision || "",
     country: address.countryFullname || "India",
     phone: contact.phone || "",
@@ -82,7 +139,7 @@ function buildDelhiveryPayload(order) {
     cod_amount: codAmount ? String(codAmount) : "",
     total_amount: String(totalAmount),
     products_desc: productsDesc,
-    quantity: String(lineItems.reduce((sum, li) => sum + (li.quantity || 1), 0)),
+    quantity: String(lineItems.reduce((sum, li) => sum + (li.qty || 1), 0)),
     weight: String(totalWeightGrams),
     seller_gst_tin: process.env.DELHIVERY_SELLER_GST || "",
     seller_name: process.env.DELHIVERY_SELLER_NAME || "",
@@ -92,14 +149,12 @@ function buildDelhiveryPayload(order) {
     shipping_mode: "Surface",
   };
 
-  const payload = {
+  return {
     pickup_location: {
       name: process.env.DELHIVERY_PICKUP_NAME || "",
     },
     shipments: [shipment],
   };
-
-  return payload;
 }
 
 export default async function handler(req, res) {
@@ -107,7 +162,7 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
-  // Optional shared-secret check
+  // Shared-secret check
   const expectedSecret = process.env.WIX_WEBHOOK_SECRET;
   if (expectedSecret) {
     const provided = req.query?.secret;
@@ -116,9 +171,6 @@ export default async function handler(req, res) {
         debug: true,
         error: "Unauthorized",
         reason: "secret_mismatch",
-        providedSecret: provided ?? null,
-        expectedSecretIsSet: true,
-        queryKeys: Object.keys(req.query || {}),
       });
     }
   }
@@ -140,23 +192,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // TEMP DEBUG: forward raw payload + headers to webhook.site for inspection
-    try {
-      await fetch("https://webhook.site/6dceb8fd-62be-48fa-a3ea-e3d74bd1c952", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          headers: req.headers,
-          query: req.query,
-          parsedBody: body,
-          rawBodyType: typeof req.body,
-        }),
-      });
-    } catch (e) {
-      // ignore debug forwarding errors
-    }
-
-    const order = extractOrderFromPayload(body);
+    const order = normalizeOrder(body);
 
     if (!order) {
       return res.status(200).json({
@@ -170,9 +206,7 @@ export default async function handler(req, res) {
     }
 
     // Only push physical/shippable orders
-    const hasShippable = (order.lineItems || []).some(
-      (li) => li.physicalProperties?.shippable
-    );
+    const hasShippable = (order.lineItems || []).some((li) => li.shippable);
     if (!hasShippable) {
       return res.status(200).json({
         skipped: true,
