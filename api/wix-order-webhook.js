@@ -149,12 +149,17 @@ function buildDelhiveryPayload(order) {
   const breadth = hasRiversBook ? 28 : 26;
   const height = isMultiSku ? 3 : 1;
 
-  // Pickup location: Mumbai Residence if order contains the Shaktipeeths hardcover
-  // (amargranth-003) or the combo set (amargranth-004), else Pune Residence.
+  // Pickup location logic:
+  // If DELHIVERY_FORCE_PICKUP_NAME is set, all orders use that location (override mode).
+  // To restore SKU-based routing, remove DELHIVERY_FORCE_PICKUP_NAME from Vercel env vars.
+  // SKU-based: Mumbai Residence for amargranth-003/004; Pune Residence for all others.
+  const forcedPickup = process.env.DELHIVERY_FORCE_PICKUP_NAME;
   const needsMumbaiPickup = lineItems.some((li) => MUMBAI_PICKUP_SKUS.has(li.sku));
-  const pickupLocationName = needsMumbaiPickup
-    ? (process.env.DELHIVERY_PICKUP_NAME_MUMBAI || "Mumbai Residence")
-    : (process.env.DELHIVERY_PICKUP_NAME_PUNE || "Pune Residence");
+  const pickupLocationName = forcedPickup
+    ? forcedPickup
+    : needsMumbaiPickup
+      ? (process.env.DELHIVERY_PICKUP_NAME_MUMBAI || "Mumbai Residence")
+      : (process.env.DELHIVERY_PICKUP_NAME_PUNE || "Pune Residence");
 
   const totalAmount = parseFloat(order.total || "0");
   const paymentStatus = order.paymentStatus; // PAID, UNPAID, PARTIALLY_PAID, etc.
